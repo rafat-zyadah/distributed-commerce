@@ -13,6 +13,8 @@ services:
       DB_DATABASE: ecommerce
       DB_USERNAME: ecommerce
       DB_PASSWORD: secret
+      INVENTORY_GRPC_HOST: inventory:50051
+
     # Run migrations and the public-storage link on every start, then serve
     command: sh -c "php artisan migrate --force && (php artisan storage:link || true) && apache2-foreground"
     volumes:
@@ -36,6 +38,17 @@ services:
       timeout: 3s
       retries: 20
 
+  inventory:
+    build:
+      context: ./inventory-service
+    expose:
+      - "50051"
+    environment:
+      INVENTORY_DB_PATH: /data/inventory.sqlite3
+    volumes:
+      - inventory-data:/data
+
 volumes:
   db-data:
   product-images:
+  inventory-data:

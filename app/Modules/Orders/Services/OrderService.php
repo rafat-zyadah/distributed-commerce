@@ -8,106 +8,171 @@ use App\Modules\Products\Models\Product;
 use App\Modules\Users\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
+use Throwable;
+use RuntimeException;
 
 class OrderService
 {
-    public function __construct(private NotificationService $notifications) {}
+    public function __construct(
+        private NotificationService $notifications,
+        private InventoryGrpc $inventory,
+    ) {}
 
     /**
-     * Place an order. Either every line is reserved and the order is created,
-     * or nothing changes at all (the transaction rolls back).
-     *
-     * @param  array<int, array{product_id: int|string, quantity: int|string}>  $items
+     * @param array<int, array{product_id: int|string, quantity: int|string}> $items
      */
     public function place(User $customer, array $items): Order
     {
-        return DB::transaction(function () use ($customer, $items) {
-            // Row locks: two customers buying the last unit at the same moment
-            // are serialized here, so the stock can never go negative.
-            $products = Product::query()
-                ->whereIn('id', collect($items)->pluck('product_id'))
-                ->lockForUpdate()
-                ->get()
-                ->keyBy('id');
+        $products = Product::query()
+            ->whereIn('id', collect($items)->pluck('product_id'))
+            ->get()
+            ->keyBy('id');
 
-            $total = 0;
-            $lines = [];
+        $lines = [];
+        $reservations = [];
+        $total = 0;
 
-            foreach ($items as $item) {
-                $productId = (int) $item['product_id'];
-                $quantity = (int) $item['quantity'];
+        foreach ($items as $item) {
+            $productId = (int) $item['product_id'];
+            $quantity = (int) $item['quantity'];
+            $product = $products->get($productId);
 
-                /** @var Product|null $product */
-                $product = $products->get($productId);
-
-                if (! $product || $product->status !== Product::STATUS_ACTIVE) {
-                    throw ValidationException::withMessages([
-                        'items' => ["Product {$productId} is not available."],
-                    ]);
-                }
-
-                if ($product->stock < $quantity) {
-                    throw ValidationException::withMessages([
-                        'items' => ["Not enough stock for '{$product->name}'. Available: {$product->stock}."],
-                    ]);
-                }
-
-                $product->decrement('stock', $quantity);
-
-                $lines[] = [
-                    'product_id' => $product->id,
-                    'quantity' => $quantity,
-                    'unit_price' => $product->price,
-                ];
-
-                $total += (float) $product->price * $quantity;
-            }
-
-            $order = Order::create([
-                'user_id' => $customer->id,
-                'status' => Order::STATUS_PENDING,
-                'total' => round($total, 2),
-            ]);
-
-            $order->items()->createMany($lines);
-
-            $this->notifications->send(
-                $customer->id,
-                'Order placed',
-                "Your order #{$order->id} was placed successfully."
-            );
-
-            return $order->load('items');
-        });
-    }
-
-    /** Admin changes the status. Cancelling gives the reserved units back to stock. */
-    public function changeStatus(Order $order, string $newStatus): Order
-    {
-        return DB::transaction(function () use ($order, $newStatus) {
-            $order = Order::query()->whereKey($order->getKey())->lockForUpdate()->firstOrFail();
-
-            if ($order->status === Order::STATUS_CANCELLED && $newStatus !== Order::STATUS_CANCELLED) {
+            if (! $product || $product->status !== Product::STATUS_ACTIVE) {
                 throw ValidationException::withMessages([
-                    'status' => ['A cancelled order cannot be reopened.'],
+                    'items' => ["Product {$productId} is not available."],
                 ]);
             }
 
-            if ($newStatus === Order::STATUS_CANCELLED && $order->status !== Order::STATUS_CANCELLED) {
-                foreach ($order->items as $item) {
-                    Product::query()->whereKey($item->product_id)->increment('stock', $item->quantity);
+            if ($quantity <= 0) {
+                throw ValidationException::withMessages([
+                    'items' => ['Quantity must be greater than zero.'],
+                ]);
+            }
+
+            $lines[] = [
+                'product_id' => $product->id,
+                'quantity' => $quantity,
+                'unit_price' => $product->price,
+            ];
+
+            $total += (float) $product->price * $quantity;
+        }
+
+        try {
+            // لا نبدأ حجزًا حتى نتحقق من جميع المنتجات أولًا.
+            foreach ($lines as $line) {
+                $this->inventory->reserve(
+                    $line['product_id'],
+                    (int) $line['quantity']
+                );
+
+                $reservations[] = $line;
+            }
+
+            return DB::transaction(function () use ($customer, $lines, $total) {
+                $order = Order::create([
+                    'user_id' => $customer->id,
+                    'status' => Order::STATUS_PENDING,
+                    'total' => round($total, 2),
+                ]);
+
+                $order->items()->createMany($lines);
+
+                $this->notifications->send(
+                    $customer->id,
+                    'Order placed',
+                    "Your order #{$order->id} was placed successfully."
+                );
+
+                return $order->load('items');
+            });
+        } catch (Throwable $exception) {
+            // إذا فشل حفظ الطلب بعد حجز بعض الكميات، نحاول إعادتها.
+            foreach (array_reverse($reservations) as $line) {
+                try {
+                    $this->inventory->release(
+                        $line['product_id'],
+                        (int) $line['quantity']
+                    );
+                } catch (Throwable $compensationException) {
+                    report($compensationException);
                 }
             }
 
-            $order->update(['status' => $newStatus]);
+            // حوّلوا حالات نقص المخزون إلى خطأ تحقق واضح للـ API.
+            if ($exception instanceof RuntimeException) {
+                throw ValidationException::withMessages([
+                    'items' => [
+                        'Inventory reservation failed. Check stock or try again.',
+                    ],
+                ]);
+            }
 
-            $this->notifications->send(
-                $order->user_id,
-                'Order status updated',
-                "Your order #{$order->id} is now {$newStatus}."
-            );
+            throw $exception;
+        }
+    }
 
-            return $order;
-        });
+    public function changeStatus(Order $order, string $newStatus): Order
+    {
+        $released = [];
+
+        try {
+            return DB::transaction(function () use ($order, $newStatus, &$released) {
+                $order = Order::query()
+                    ->whereKey($order->getKey())
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                if (
+                    $order->status === Order::STATUS_CANCELLED
+                    && $newStatus !== Order::STATUS_CANCELLED
+                ) {
+                    throw ValidationException::withMessages([
+                        'status' => ['A cancelled order cannot be reopened.'],
+                    ]);
+                }
+
+                if (
+                    $newStatus === Order::STATUS_CANCELLED
+                    && $order->status !== Order::STATUS_CANCELLED
+                ) {
+                    foreach ($order->items as $item) {
+                        $this->inventory->release(
+                            $item->product_id,
+                            (int) $item->quantity
+                        );
+
+                        $released[] = [
+                            'product_id' => $item->product_id,
+                            'quantity' => (int) $item->quantity,
+                        ];
+                    }
+                }
+
+                $order->update(['status' => $newStatus]);
+
+                $this->notifications->send(
+                    $order->user_id,
+                    'Order status updated',
+                    "Your order #{$order->id} is now {$newStatus}."
+                );
+
+                return $order->load('items');
+            });
+        } catch (Throwable $exception) {
+            // إذا فشلت معاملة MySQL بعد إرجاع المخزون، نحاول إعادة حجزه.
+            foreach (array_reverse($released) as $line) {
+                try {
+                    $this->inventory->reserve(
+                        $line['product_id'],
+                        $line['quantity']
+                    );
+                } catch (Throwable $compensationException) {
+                    report($compensationException);
+                }
+            }
+
+            throw $exception;
+        }
     }
 }

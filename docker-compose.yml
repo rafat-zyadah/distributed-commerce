@@ -6,25 +6,41 @@ services:
     env_file:
       - .env
     environment:
-      # These override the values in .env so the app talks to the db container
+      # These override the values in .env so the app talks to the containers
       DB_CONNECTION: mysql
       DB_HOST: db
       DB_PORT: 3306
       DB_DATABASE: ecommerce
       DB_USERNAME: ecommerce
       DB_PASSWORD: secret
+      # Read replica. Used only when PERF_REPLICA_ENABLED is true (see PERFORMANCE.md)
+      DB_READ_HOST: db-replica
+      DB_READ_PORT: 3306
+      PERF_CACHE_ENABLED: "${PERF_CACHE_ENABLED:-true}"
+      PERF_REPLICA_ENABLED: "${PERF_REPLICA_ENABLED:-false}"
+      CACHE_STORE: redis
+      REDIS_HOST: redis
       INVENTORY_GRPC_HOST: inventory:50051
 
-    # Run migrations and the public-storage link on every start, then serve
+    # Run migrations and the public-storage link on every start, then serve.
+    # The performance indexes are NOT applied here (see PERFORMANCE.md).
     command: sh -c "php artisan migrate --force && (php artisan storage:link || true) && apache2-foreground"
     volumes:
       - product-images:/var/www/html/storage/app/public
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
 
+  # Primary: takes every write. GTIDs are required for the replica's consistency check.
   db:
     image: mysql:8.4
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
     environment:
       MYSQL_DATABASE: ecommerce
       MYSQL_USER: ecommerce
@@ -33,10 +49,63 @@ services:
     volumes:
       - db-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      # 127.0.0.1 (TCP), not localhost (socket). On first start the image runs a temporary server
+      # without TCP, so this check passes only once the real server is listening.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 30
+      start_period: 20s
+
+  # Replica: serves the reads that ReadRouter allows. Connected by the replica-setup service.
+  db-replica:
+    image: mysql:8.4
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - db-replica-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # One-shot: creates the replication user, the app's database and read-only user on the
+  # replica, then starts replication. Exits when done. Safe to run again.
+  replica-setup:
+    image: mysql:8.4
+    depends_on:
+      db:
+        condition: service_healthy
+      db-replica:
+        condition: service_healthy
+    environment:
+      ROOT_PASSWORD: root
+      REPLICATION_USER: repl
+      REPLICATION_PASSWORD: repl_secret
+      APP_DATABASE: ecommerce
+      APP_USER: ecommerce
+      APP_PASSWORD: secret
+    volumes:
+      - ./docker/mysql/setup-replica.sh:/setup-replica.sh:ro
+    entrypoint: ["sh", "/setup-replica.sh"]
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    # No disk persistence: this is a cache. When memory is full, the least recently used keys are dropped.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   inventory:
     build:
@@ -50,5 +119,6 @@ services:
 
 volumes:
   db-data:
+  db-replica-data:
   product-images:
   inventory-data:

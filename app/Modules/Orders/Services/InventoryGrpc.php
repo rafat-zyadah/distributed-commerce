@@ -11,15 +11,19 @@ use RuntimeException;
 
 class InventoryGrpc
 {
-    private InventoryServiceClient $client;
+    private ?InventoryServiceClient $client = null;
 
-    public function __construct()
+    private function client(): InventoryServiceClient
     {
-        $host = getenv('INVENTORY_GRPC_HOST') ?: 'inventory:50051';
+        if ($this->client === null) {
+            $host = getenv('INVENTORY_GRPC_HOST') ?: 'inventory:50051';
 
-        $this->client = new InventoryServiceClient($host, [
-            'credentials' => ChannelCredentials::createInsecure(),
-        ]);
+            $this->client = new InventoryServiceClient($host, [
+                'credentials' => ChannelCredentials::createInsecure(),
+            ]);
+        }
+
+        return $this->client;
     }
 
     public function reserve(int|string $productId, int $quantity): void
@@ -28,7 +32,7 @@ class InventoryGrpc
         $request->setProductId((string) $productId);
         $request->setQuantity($quantity);
 
-        [, $status] = $this->client->ReserveStock(
+        [, $status] = $this->client()->ReserveStock(
             $request,
             [],
             ['timeout' => 5000000]
@@ -43,7 +47,7 @@ class InventoryGrpc
         $request->setProductId((string) $productId);
         $request->setQuantity($quantity);
 
-        [, $status] = $this->client->ReleaseStock(
+        [, $status] = $this->client()->ReleaseStock(
             $request,
             [],
             ['timeout' => 5000000]

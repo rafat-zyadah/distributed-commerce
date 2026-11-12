@@ -71,7 +71,8 @@ class AuthTest extends TestCase
 
     public function test_responses_carry_security_headers(): void
     {
-        $this->getJson('/api/v1/products')
+        // A 401 from a protected route. The product catalog sets its own Cache-Control (see PerformanceTest).
+        $this->getJson('/api/v1/auth/me')
             ->assertHeader('X-Content-Type-Options', 'nosniff')
             ->assertHeader('X-Frame-Options', 'DENY')
             ->assertHeader('Cache-Control', 'no-store, private');

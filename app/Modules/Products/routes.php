@@ -6,7 +6,7 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('products')->group(function () {
     // Public reads
     Route::get('/', [ProductController::class, 'index']);
-    Route::get('{product}', [ProductController::class, 'show']);
+    Route::get('{product}', [ProductController::class, 'show'])->whereNumber('product');
 
     // Admin writes
     Route::middleware(['auth:api', 'role:admin'])->group(function () {

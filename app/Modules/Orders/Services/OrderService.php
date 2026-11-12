@@ -4,6 +4,7 @@ namespace App\Modules\Orders\Services;
 
 use App\Modules\Notifications\Services\NotificationService;
 use App\Modules\Orders\Models\Order;
+use App\Modules\Orders\Models\OrderItem;
 use App\Modules\Products\Models\Product;
 use App\Modules\Users\Models\User;
 use Illuminate\Support\Facades\DB;
@@ -69,14 +70,18 @@ class OrderService
                 $reservations[] = $line;
             }
 
-            return DB::transaction(function () use ($customer, $lines, $total) {
+            $order = DB::transaction(function () use ($customer, $lines, $total) {
                 $order = Order::create([
                     'user_id' => $customer->id,
                     'status' => Order::STATUS_PENDING,
                     'total' => round($total, 2),
                 ]);
 
-                $order->items()->createMany($lines);
+                // One INSERT for all lines. Calling createMany() would send one INSERT per line.
+                OrderItem::query()->insert(array_map(
+                    fn (array $line) => $line + ['order_id' => $order->id],
+                    $lines
+                ));
 
                 $this->notifications->send(
                     $customer->id,
@@ -110,6 +115,8 @@ class OrderService
 
             throw $exception;
         }
+
+        return $order;
     }
 
     public function changeStatus(Order $order, string $newStatus): Order
@@ -117,10 +124,12 @@ class OrderService
         $released = [];
 
         try {
-            return DB::transaction(function () use ($order, $newStatus, &$released) {
+            $updated = DB::transaction(function () use ($order, $newStatus, &$released) {
+                // items are loaded now, so the loop below does not run one query per item.
                 $order = Order::query()
                     ->whereKey($order->getKey())
                     ->lockForUpdate()
+                    ->with('items')
                     ->firstOrFail();
 
                 if (
@@ -174,5 +183,7 @@ class OrderService
 
             throw $exception;
         }
+
+        return $updated;
     }
 }

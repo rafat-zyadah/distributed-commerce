@@ -5,6 +5,7 @@ namespace App\Modules\Orders\Http\Controllers;
 use App\Modules\Orders\Http\Resources\OrderResource;
 use App\Modules\Orders\Models\Order;
 use App\Modules\Orders\Services\OrderService;
+use App\Support\Replication\ReadRouter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
@@ -13,7 +14,10 @@ use Illuminate\Validation\Rule;
 
 class OrderController extends Controller
 {
-    public function __construct(private OrderService $orders) {}
+    public function __construct(
+        private OrderService $orders,
+        private ReadRouter $reads,
+    ) {}
 
     /** Customers get their own orders; admins get all orders. */
     public function index(Request $request): JsonResponse
@@ -25,7 +29,8 @@ class OrderController extends Controller
 
         $user = auth('api')->user();
 
-        $orders = Order::query()
+        // Read: may be served by the replica (see ReadRouter for the consistency rule).
+        $orders = Order::on($this->reads->readConnection())
             ->with('items')
             ->when(! $user->isAdmin(), fn ($q) => $q->where('user_id', $user->id))
             ->when($data['status'] ?? null, fn ($q, $status) => $q->where('status', $status))
@@ -49,11 +54,19 @@ class OrderController extends Controller
         return (new OrderResource($order))->response()->setStatusCode(201);
     }
 
-    public function show(Order $order): JsonResponse
+    /**
+     * The id is looked up here instead of by route-model binding, so the read
+     * can use the replica. The policy check is unchanged.
+     */
+    public function show(int $order): JsonResponse
     {
-        Gate::authorize('view', $order); // 403 if the order belongs to someone else
+        $found = Order::on($this->reads->readConnection())
+            ->with('items')
+            ->findOrFail($order);
 
-        return (new OrderResource($order->load('items')))->response();
+        Gate::authorize('view', $found); // 403 if the order belongs to someone else
+
+        return (new OrderResource($found))->response();
     }
 
     /** Admin only: policy check plus route middleware role:admin. */

@@ -141,3 +141,9 @@ app/Modules/
 4. افتح `http://localhost:8000/api/v1/products`
 
 الملف `docker-compose.yml` يشغّل MySQL 8.4 ويطبّق الـ migrations تلقائياً عند البدء.
+
+---
+
+## المساهمون (Contributors)
+
+- **MOAdnan23** — قام بتحديث ملف README وتوثيق المشروع.

@@ -21,6 +21,11 @@ services:
       CACHE_STORE: redis
       REDIS_HOST: redis
       INVENTORY_GRPC_HOST: inventory:50051
+      # إعدادات الاتصال بـ RabbitMQ إذا كان تطبيقك يحتاجها
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: app
+      RABBITMQ_PASSWORD: secret
 
     # Run migrations and the public-storage link on every start, then serve.
     # The performance indexes are NOT applied here (see PERFORMANCE.md).
@@ -30,8 +35,42 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      db-replica:
+        condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # خدمة الـ Worker لمعالجة طوابير المهام عبر RabbitMQ
+  worker:
+    build: .
+    command: >
+      php artisan queue:work rabbitmq
+      --queue=emails
+      --tries=5
+      --timeout=45
+      --sleep=3
+    env_file:
+      - .env
+    environment:
+      DB_CONNECTION: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_DATABASE: ecommerce
+      DB_USERNAME: ecommerce
+      DB_PASSWORD: secret
+      QUEUE_CONNECTION: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: app
+      RABBITMQ_PASSWORD: secret
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
   # Primary: takes every write. GTIDs are required for the replica's consistency check.
   db:
@@ -49,8 +88,6 @@ services:
     volumes:
       - db-data:/var/lib/mysql
     healthcheck:
-      # 127.0.0.1 (TCP), not localhost (socket). On first start the image runs a temporary server
-      # without TCP, so this check passes only once the real server is listening.
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 5s
       timeout: 3s
@@ -99,7 +136,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    # No disk persistence: this is a cache. When memory is full, the least recently used keys are dropped.
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -117,8 +153,27 @@ services:
     volumes:
       - inventory-data:/data
 
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: secret
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   db-data:
   db-replica-data:
   product-images:
   inventory-data:
+  rabbitmq-data:

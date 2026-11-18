@@ -1,37 +1,58 @@
+
 services:
+  # Laravel Application
   app:
     build: .
     ports:
       - "8000:80"
+
     env_file:
       - .env
+
     environment:
-      # These override the values in .env so the app talks to the containers
+      # MySQL
       DB_CONNECTION: mysql
       DB_HOST: db
       DB_PORT: 3306
       DB_DATABASE: ecommerce
       DB_USERNAME: ecommerce
       DB_PASSWORD: secret
-      # Read replica. Used only when PERF_REPLICA_ENABLED is true (see PERFORMANCE.md)
+
+      # Read Replica
       DB_READ_HOST: db-replica
       DB_READ_PORT: 3306
       PERF_CACHE_ENABLED: "${PERF_CACHE_ENABLED:-true}"
       PERF_REPLICA_ENABLED: "${PERF_REPLICA_ENABLED:-false}"
+
+      # Redis
       CACHE_STORE: redis
       REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # Inventory gRPC
       INVENTORY_GRPC_HOST: inventory:50051
-      # إعدادات الاتصال بـ RabbitMQ إذا كان تطبيقك يحتاجها
+
+      # RabbitMQ
+      QUEUE_CONNECTION: rabbitmq
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: app
       RABBITMQ_PASSWORD: secret
 
-    # Run migrations and the public-storage link on every start, then serve.
-    # The performance indexes are NOT applied here (see PERFORMANCE.md).
-    command: sh -c "php artisan migrate --force && (php artisan storage:link || true) && apache2-foreground"
+      # Laravel Reverb
+      BROADCAST_CONNECTION: reverb
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
+
+    command: >
+      sh -c "php artisan migrate --force &&
+      (php artisan storage:link || true) &&
+      apache2-foreground"
+
     volumes:
       - product-images:/var/www/html/storage/app/public
+
     depends_on:
       db:
         condition: service_healthy
@@ -42,51 +63,121 @@ services:
       rabbitmq:
         condition: service_healthy
 
-  # خدمة الـ Worker لمعالجة طوابير المهام عبر RabbitMQ
+  # Queue Worker
   worker:
     build: .
+
     command: >
       php artisan queue:work rabbitmq
       --queue=emails
       --tries=5
       --timeout=45
       --sleep=3
+
     env_file:
       - .env
+
     environment:
+      # MySQL
       DB_CONNECTION: mysql
       DB_HOST: db
       DB_PORT: 3306
       DB_DATABASE: ecommerce
       DB_USERNAME: ecommerce
       DB_PASSWORD: secret
+
+      # Redis
+      CACHE_STORE: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # RabbitMQ
       QUEUE_CONNECTION: rabbitmq
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: app
       RABBITMQ_PASSWORD: secret
+
+      # Laravel Reverb
+      BROADCAST_CONNECTION: reverb
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
+
     depends_on:
       rabbitmq:
         condition: service_healthy
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
     restart: unless-stopped
 
-  # Primary: takes every write. GTIDs are required for the replica's consistency check.
+  # Laravel Reverb - Real-time WebSocket Server
+  reverb:
+    build: .
+
+    command: >
+      php artisan reverb:start
+      --host=0.0.0.0
+      --port=8080
+
+    env_file:
+      - .env
+
+    environment:
+      # MySQL
+      DB_CONNECTION: mysql
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_DATABASE: ecommerce
+      DB_USERNAME: ecommerce
+      DB_PASSWORD: secret
+
+      # Redis
+      CACHE_STORE: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # Laravel Reverb
+      BROADCAST_CONNECTION: reverb
+      REVERB_HOST: reverb
+      REVERB_PORT: 8080
+      REVERB_SCHEME: http
+      REVERB_SERVER_HOST: 0.0.0.0
+      REVERB_SERVER_PORT: 8080
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+  # Primary MySQL Database
   db:
     image: mysql:8.4
+
     command:
       - --server-id=1
       - --log-bin=mysql-bin
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
+
     environment:
       MYSQL_DATABASE: ecommerce
       MYSQL_USER: ecommerce
       MYSQL_PASSWORD: secret
       MYSQL_ROOT_PASSWORD: root
+
     volumes:
       - db-data:/var/lib/mysql
+
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 5s
@@ -94,18 +185,22 @@ services:
       retries: 30
       start_period: 20s
 
-  # Replica: serves the reads that ReadRouter allows. Connected by the replica-setup service.
+  # Read Replica
   db-replica:
     image: mysql:8.4
+
     command:
       - --server-id=2
       - --log-bin=mysql-bin
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
+
     environment:
       MYSQL_ROOT_PASSWORD: root
+
     volumes:
       - db-replica-data:/var/lib/mysql
+
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
       interval: 5s
@@ -113,15 +208,16 @@ services:
       retries: 30
       start_period: 20s
 
-  # One-shot: creates the replication user, the app's database and read-only user on the
-  # replica, then starts replication. Exits when done. Safe to run again.
+  # Replica Setup
   replica-setup:
     image: mysql:8.4
+
     depends_on:
       db:
         condition: service_healthy
       db-replica:
         condition: service_healthy
+
     environment:
       ROOT_PASSWORD: root
       REPLICATION_USER: repl
@@ -129,42 +225,66 @@ services:
       APP_DATABASE: ecommerce
       APP_USER: ecommerce
       APP_PASSWORD: secret
+
     volumes:
       - ./docker/mysql/setup-replica.sh:/setup-replica.sh:ro
+
     entrypoint: ["sh", "/setup-replica.sh"]
+
     restart: "no"
 
+  # Redis
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  # Inventory gRPC Service
   inventory:
     build:
       context: ./inventory-service
+
     expose:
       - "50051"
+
     environment:
       INVENTORY_DB_PATH: /data/inventory.sqlite3
+
     volumes:
       - inventory-data:/data
 
+  # RabbitMQ
   rabbitmq:
     image: rabbitmq:4-management
     hostname: rabbitmq
+
     ports:
       - "5672:5672"
       - "15672:15672"
+
     environment:
       RABBITMQ_DEFAULT_USER: app
       RABBITMQ_DEFAULT_PASS: secret
       RABBITMQ_DEFAULT_VHOST: /
+
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s

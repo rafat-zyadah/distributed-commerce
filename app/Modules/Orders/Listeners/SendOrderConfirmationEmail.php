@@ -13,7 +13,7 @@ class SendOrderConfirmationEmail implements ShouldQueue
 {
     public int $tries = 5;
 
-    public array $backoff = [10, 30, 60, 120];
+    public array $backoff = [10, 12, 14, 16];
 
     public function viaConnection(): string
     {
@@ -27,6 +27,8 @@ class SendOrderConfirmationEmail implements ShouldQueue
 
     public function handle(OrderPlaced $event): void
     {
+        //throw new \RuntimeException('Testing RabbitMQ retry and DLQ');
+
         $order = Order::with(['user', 'items'])
             ->findOrFail($event->orderId);
 

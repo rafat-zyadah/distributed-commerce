@@ -37,6 +37,7 @@ services:
   # Third Laravel instance - same configuration
   app3:
     <<: *laravel-app
+
   # Shared database queue workers
   worker1: &queue-worker
     <<: *laravel-app

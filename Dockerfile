@@ -1,5 +1,5 @@
 
-FROM php:8.2-apache
+FROM clegginabox/php-grpc:8.2-apache
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -14,9 +14,7 @@ RUN apt-get update \
 
 RUN pecl channel-update pecl.php.net \
  && pecl install redis \
- && pecl install grpc-1.85.0 \
- && docker-php-ext-enable redis grpc
-
+ && docker-php-ext-enable redis
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 ENV APACHE_DOCUMENT_ROOT=/var/www/html/public

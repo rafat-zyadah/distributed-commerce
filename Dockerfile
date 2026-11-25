@@ -1,6 +1,5 @@
-FROM php:8.2-apache
 
-RUN docker-php-ext-install pcntl
+FROM php:8.2-apache
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -10,24 +9,13 @@ RUN apt-get update \
     libzip-dev \
     libpng-dev \
     libonig-dev \
-    zlib1g-dev \
- && docker-php-ext-install \
-    pdo_mysql \
-    mbstring \
-    zip \
-    gd \
-    bcmath \
-    sockets \
+ && docker-php-ext-install pdo_mysql mbstring zip gd bcmath \
  && rm -rf /var/lib/apt/lists/*
 
-# Install PHP gRPC extension
 RUN pecl channel-update pecl.php.net \
- && MAKEFLAGS="-j2" pecl install grpc-1.85.0 \
- && docker-php-ext-enable grpc
-
-# Install Redis extension
-RUN pecl install redis \
- && docker-php-ext-enable redis
+ && pecl install redis \
+ && pecl install grpc-1.85.0 \
+ && docker-php-ext-enable redis grpc
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
@@ -41,9 +29,7 @@ WORKDIR /var/www/html
 
 COPY . .
 
-RUN composer install --no-dev --optimize-autoloader --no-interaction \
+RUN composer install --optimize-autoloader --no-interaction \
  && chown -R www-data:www-data storage bootstrap/cache
 
 EXPOSE 80
-
-

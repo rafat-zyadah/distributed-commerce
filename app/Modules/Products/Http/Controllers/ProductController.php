@@ -11,11 +11,6 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Validation\Rule;
-use RuntimeException;
-use Throwable;
-use Grpc\ChannelCredentials;
-use Inventory\InventoryServiceClient;
-use Inventory\SetStockRequest;
 use Symfony\Component\HttpFoundation\Response as HttpResponse;
 
 class ProductController extends Controller
@@ -33,8 +28,8 @@ class ProductController extends Controller
             'per_page' => ['nullable', 'integer', 'min:1', 'max:50'],
         ]);
 
-        $isAdmin = auth('api')->user()?->isAdmin() ?? false;
-        $category = $data['category'] ?? null;
+$isAdmin = $request->bearerToken() !== null
+    && (auth('api')->user()?->isAdmin() ?? false);        $category = $data['category'] ?? null;
         $perPage = $data['per_page'] ?? 10;
 
         return $this->cachedResponse(
@@ -59,7 +54,8 @@ class ProductController extends Controller
     /** Public: inactive products are hidden (404) from non-admins. */
     public function show(Request $request, int $product): HttpResponse
     {
-        $isAdmin = auth('api')->user()?->isAdmin() ?? false;
+        $isAdmin = $request->bearerToken() !== null
+    && (auth('api')->user()?->isAdmin() ?? false);
 
         return $this->cachedResponse(
             $request,
@@ -68,6 +64,7 @@ class ProductController extends Controller
             function () use ($product, $isAdmin) {
                 $item = Product::on($this->reads->readConnection())->find($product);
 
+                // The 404 is thrown before anything is stored, so 404s are never cached.
                 if ($item === null || ($item->status !== Product::STATUS_ACTIVE && ! $isAdmin)) {
                     abort(404);
                 }
@@ -77,7 +74,7 @@ class ProductController extends Controller
         );
     }
 
-    /** Admin only. Create product and synchronize its inventory. */
+    /** Admin only (route middleware role:admin). The observer invalidates the cache. */
     public function store(Request $request): JsonResponse
     {
         $data = $request->validate([
@@ -93,33 +90,16 @@ class ProductController extends Controller
         if ($request->hasFile('image')) {
             $data['image_path'] = $request->file('image')->store('products', 'public');
         }
-
         unset($data['image']);
 
         $data['status'] ??= Product::STATUS_ACTIVE;
 
         $product = Product::create($data);
 
-        try {
-            $this->synchronizeInventory(
-                $product->id,
-                (int) $product->stock
-            );
-        } catch (Throwable $exception) {
-            report($exception);
-
-            // Do not leave a product that has no corresponding inventory.
-            $product->delete();
-
-            return response()->json([
-                'message' => 'Product was not created because inventory synchronization failed.',
-            ], 503);
-        }
-
         return (new ProductResource($product))->response()->setStatusCode(201);
     }
 
-    /** Admin only. Update product and synchronize stock when supplied. */
+    /** Admin only. */
     public function update(Request $request, Product $product): JsonResponse
     {
         $data = $request->validate([
@@ -129,21 +109,6 @@ class ProductController extends Controller
             'price' => ['sometimes', 'numeric', 'min:0', 'max:999999.99'],
             'stock' => ['sometimes', 'integer', 'min:0'],
         ]);
-
-        if (array_key_exists('stock', $data)) {
-            try {
-                $this->synchronizeInventory(
-                    $product->id,
-                    (int) $data['stock']
-                );
-            } catch (Throwable $exception) {
-                report($exception);
-
-                return response()->json([
-                    'message' => 'Product was not updated because inventory synchronization failed.',
-                ], 503);
-            }
-        }
 
         $product->update($data);
 
@@ -163,41 +128,8 @@ class ProductController extends Controller
     }
 
     /**
-     * Synchronize product stock with the Inventory gRPC service.
-     */
-    private function synchronizeInventory(int $productId, int $quantity): void
-    {
-        $client = new InventoryServiceClient(
-            'inventory:50051',
-            [
-                'credentials' => ChannelCredentials::createInsecure(),
-            ]
-        );
-
-        $request = new SetStockRequest();
-        $request->setProductId((string) $productId);
-        $request->setQuantity($quantity);
-
-        [$reply, $status] = $client
-            ->SetStock($request, [], ['timeout' => 5000000])
-            ->wait();
-
-        if ($status->code !== \Grpc\STATUS_OK) {
-            throw new RuntimeException(
-                'Inventory SetStock failed: ' . $status->details
-            );
-        }
-
-        if ($reply->getProductId() !== (string) $productId
-            || $reply->getQuantity() !== $quantity) {
-            throw new RuntimeException(
-                'Inventory returned an unexpected stock value.'
-            );
-        }
-    }
-
-    /**
      * Serves a catalog read with Redis caching and ETag revalidation.
+     * $load runs only on a cache miss, and returns the JSON payload as an array.
      */
     private function cachedResponse(Request $request, string $name, array $params, Closure $load): HttpResponse
     {
@@ -208,6 +140,7 @@ class ProductController extends Controller
         $version = $this->catalog->version();
         $etag = $this->catalog->etag($version, $name, $params);
 
+        // The client already holds this version: answer 304 without touching Redis or MySQL.
         if ($this->clientHoldsTag($request, $etag)) {
             return $this->withCacheHeaders(new HttpResponse('', 304), $etag);
         }
@@ -220,6 +153,7 @@ class ProductController extends Controller
     private function clientHoldsTag(Request $request, string $etag): bool
     {
         foreach ($request->getETags() as $tag) {
+            // Weak comparison (RFC 9110): "W/" prefixes are ignored.
             if (ltrim($tag, 'W/') === '"'.$etag.'"') {
                 return true;
             }
@@ -230,7 +164,10 @@ class ProductController extends Controller
 
     private function withCacheHeaders(HttpResponse $response, string $etag): HttpResponse
     {
+        // Weak validator: the same product data may be serialized slightly differently (for example pagination links).
         $response->setEtag($etag, true);
+
+        // Browsers may keep the response, but must ask the server before reusing it.
         $response->headers->set('Cache-Control', 'private, no-cache');
         $response->headers->set('Vary', 'Authorization');
 

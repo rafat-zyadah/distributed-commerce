@@ -15,11 +15,6 @@ use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
 
-use Illuminate\Support\Facades\Event;
-
-use App\Modules\Orders\Events\OrderPlaced;
-use App\Modules\Orders\Listeners\SendOrderConfirmationEmail;
-
 class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
@@ -47,11 +42,5 @@ class AppServiceProvider extends ServiceProvider
 
             return Limit::perMinute(5)->by($email.'|'.$request->ip());
         });
-
-        Event::listen(
-            OrderPlaced::class,
-            SendOrderConfirmationEmail::class
-        );
-
     }
 }

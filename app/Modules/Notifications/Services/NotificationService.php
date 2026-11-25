@@ -2,16 +2,27 @@
 
 namespace App\Modules\Notifications\Services;
 
-use App\Modules\Notifications\Models\Notification;
+use App\Jobs\CreateNotificationJob;
+use Illuminate\Support\Str;
 
 class NotificationService
 {
-    public function send(int $userId, string $title, string $message): Notification
+    public function send(int $userId, string $title, string $message): void
     {
-        return Notification::create([
-            'user_id' => $userId,
-            'title' => $title,
-            'message' => $message,
-        ]);
+        $job = new CreateNotificationJob(
+            userId: $userId,
+            title: $title,
+            message: $message,
+            eventKey: (string) Str::uuid()
+        );
+
+        // Keep existing tests synchronous.
+        if (config('queue.default') === 'sync') {
+            dispatch_sync($job);
+            return;
+        }
+
+        // Dispatch only after the database transaction commits.
+        dispatch($job)->afterCommit();
     }
 }

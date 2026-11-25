@@ -1,4 +1,3 @@
-
 <?php
 
 use App\Http\Middleware\EnsureRole;
@@ -14,18 +13,13 @@ use PHPOpenSourceSaver\JWTAuth\Exceptions\JWTException;
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: __DIR__.'/../routes/web.php',
-        api: __DIR__.'/../routes/api.php',
+        api: __DIR__.'/../routes/api.php',   // all API routes get the /api prefix
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
     )
-    ->withBroadcasting(
-        __DIR__.'/../routes/channels.php',
-        [
-            'prefix' => 'api',
-            'middleware' => ['api', 'auth:api'],
-        ]
-    )
+    ->withCommands()
     ->withMiddleware(function (Middleware $middleware): void {
+        // Security headers on every API response.
         $middleware->api(append: [
             SecurityHeaders::class,
         ]);
@@ -35,31 +29,19 @@ return Application::configure(basePath: dirname(__DIR__))
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
+        // The API always answers with JSON, never with an HTML page or a redirect.
+        $exceptions->shouldRenderJsonWhen(fn (Request $request) => $request->is('api/*'));
 
-        $exceptions->shouldRenderJsonWhen(
-            fn (Request $request) => $request->is('api/*')
-        );
-
-        $exceptions->render(function (
-            AuthenticationException $e,
-            Request $request
-        ): ?JsonResponse {
+        $exceptions->render(function (AuthenticationException $e, Request $request): ?JsonResponse {
             return $request->is('api/*')
-                ? response()->json([
-                    'message' => 'Unauthenticated.',
-                ], 401)
+                ? response()->json(['message' => 'Unauthenticated.'], 401)
                 : null;
         });
 
-        $exceptions->render(function (
-            JWTException $e,
-            Request $request
-        ): ?JsonResponse {
+        // Bad, expired or missing-signature JWTs become a clean 401.
+        $exceptions->render(function (JWTException $e, Request $request): ?JsonResponse {
             return $request->is('api/*')
-                ? response()->json([
-                    'message' => 'Invalid or expired token.',
-                ], 401)
+                ? response()->json(['message' => 'Invalid or expired token.'], 401)
                 : null;
         });
-    })
-    ->create();
+    })->create();
